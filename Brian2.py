@@ -46,7 +46,7 @@ gI = 1/sqrt(K)  # Inhibitory conductance (dimensionless)
 
 
 defaultclock.dt = 0.01 * ms
-# Define the dimensionless QIF neuron model
+# Define the dimensionless LIF neuron model
 eqs = '''
 dv/dt = (v0 - v) / tau : 1  (unless refractory)
 v0 : 1
