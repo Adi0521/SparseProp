@@ -2,13 +2,18 @@ using DataStructures, RandomNumbers.Xorshifts, StatsBase, PyPlot, Random, Delimi
 
 function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const, seed_init, seed_topo, input_delays_sec::Vector{Float64}=Float64[];
                        sample_times_sec::AbstractVector{<:Real}=Float64[], record_ids::AbstractVector{Int}=Int[],
-                       trace_ids::AbstractVector{Int}=Int[])
+                       trace_ids::AbstractVector{Int}=Int[], init_perturb::Vector{Float64}=Float64[])
     ext_input = mem_time_const * sqrt(in_degree) * synaptic_weight * target_rate # ext_input given by balance equation
     phase_speed, ptc_amplitude = 1 / log(1.0 + 1 / ext_input), synaptic_weight / sqrt(in_degree) / (1.0 + ext_input) # phase velocity LIF
     phase_threshold, current_time = 1.0, 0.0 # threshold for LIF
     rng = Xoroshiro128Plus(seed_init) # init. random number generator
     # Heap 1 — spike-time heap (min-heap): absolute next-fire times
-    fire_time_heap = MutableBinaryHeap{Float64,DataStructures.FasterForward}(phase_threshold .- rand(rng, num_neurons))
+    init_phases = rand(rng, num_neurons)
+    if !isempty(init_perturb) # optional shift of initial phases (perturbation experiments)
+        @assert length(init_perturb) == num_neurons "init_perturb must have length num_neurons"
+        init_phases .+= init_perturb
+    end
+    fire_time_heap = MutableBinaryHeap{Float64,DataStructures.FasterForward}(phase_threshold .- init_phases)
 
     spike_neuron_ids = Int64[] # initialize spike record
     # Heap 2 — arrival-time heap (min-heap): scheduled delivery times
