@@ -142,7 +142,7 @@ end
 function save_spikes_csv(filename::String, neuron_ids::Vector{Int64}, spike_times::Vector{Float64})
     open(filename, "w") do io
         println(io, "neuron_id,spike_time_s")
-        writedlm(io, hcat(neuron_ids, spike_times), ',')
+        writedlm(io, zip(neuron_ids, spike_times), ',') # zip keeps ids as integers
     end
 end
 
