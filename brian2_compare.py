@@ -15,6 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("case_dir", nargs="?", default="comparison/nodelay", help="folder written by export_for_brian.jl")
 parser.add_argument("--dt", type=float, default=None, help="simulation time step in seconds (default: dt in params.csv)")
 parser.add_argument("--plot", action="store_true", help="overlay Brian2 and Julia rasters")
+parser.add_argument("--trace-window", type=float, default=0.3, help="seconds of every-step voltage traces to save")
 args = parser.parse_args()
 
 # Parameters (Vt=1, Vreset=0 units, already converted by Julia)
@@ -54,6 +55,10 @@ Ci.delay = delays * second  # Brian2 rounds to whole time steps; export_for_bria
 # Monitors: voltages at the same multiples of record_dt as voltages_julia.csv
 spikemon = SpikeMonitor(P)
 statemon = StateMonitor(P, 'v', record=True, dt=record_dt)
+# every-step traces of the neurons Julia traced exactly (traces_julia.csv)
+trace_file = os.path.join(args.case_dir, "traces_julia.csv")
+trace_ids = np.unique(np.loadtxt(trace_file, delimiter=",", skiprows=1, ndmin=2)[:, 0]).astype(int) if os.path.exists(trace_file) else []
+tracemon = StateMonitor(P, 'v', record=trace_ids - 1) if len(trace_ids) else None
 
 run(duration)
 
@@ -65,6 +70,12 @@ np.savetxt(spike_file, np.column_stack([spikemon.i[:] + 1, spikemon.t[:] / secon
 voltage_file = os.path.join(args.case_dir, f"voltages_brian_{tag}.csv")
 np.savetxt(voltage_file, np.column_stack([statemon.t[:] / second, statemon.v[:].T]),
            delimiter=",", header="time_s," + ",".join(str(i) for i in range(1, N + 1)), comments="", fmt="%.17g")
+
+if tracemon is not None:
+    keep = tracemon.t[:] / second < args.trace_window
+    np.savetxt(os.path.join(args.case_dir, f"traces_brian_{tag}.csv"),
+               np.column_stack([tracemon.t[:][keep] / second, tracemon.v[:, keep].T]),
+               delimiter=",", header="time_s," + ",".join(str(i) for i in trace_ids), comments="", fmt="%.17g")
 
 print(f"{args.case_dir} (dt = {sim_dt:g} s): {spikemon.num_spikes} spikes, {len(sources)} synapses, "
       f"mean rate = {spikemon.num_spikes / N / float(duration):.4f} Hz")

@@ -1,7 +1,8 @@
 using DataStructures, RandomNumbers.Xorshifts, StatsBase, PyPlot, Random, DelimitedFiles
 
 function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const, seed_init, seed_topo, input_delays_sec::Vector{Float64}=Float64[];
-                       sample_times_sec::AbstractVector{<:Real}=Float64[], record_ids::AbstractVector{Int}=Int[])
+                       sample_times_sec::AbstractVector{<:Real}=Float64[], record_ids::AbstractVector{Int}=Int[],
+                       trace_ids::AbstractVector{Int}=Int[])
     ext_input = mem_time_const * sqrt(in_degree) * synaptic_weight * target_rate # ext_input given by balance equation
     phase_speed, ptc_amplitude = 1 / log(1.0 + 1 / ext_input), synaptic_weight / sqrt(in_degree) / (1.0 + ext_input) # phase velocity LIF
     phase_threshold, current_time = 1.0, 0.0 # threshold for LIF
@@ -33,6 +34,13 @@ function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, targ
     sample_idx = 1
     drive = 1.0 + ext_input # I_eff (Vreset=0, Vt=1)
 
+    # voltage traces: log (time, voltage after the event) for trace_ids at every reset and every input
+    @assert all(1 .<= trace_ids .<= num_neurons) "trace_ids must be in 1:num_neurons"
+    trace_row = zeros(Int, num_neurons) # neuron → index into trace_log (0 = not traced)
+    trace_row[trace_ids] .= 1:length(trace_ids)
+    trace_log = [NTuple{2,Float64}[] for _ in trace_ids]
+    log_traces!(trace_log, trace_row, trace_ids, fire_time_heap, current_time, phase_threshold, phase_speed, drive) # initial state
+
     while length(spike_neuron_ids) < num_spikes # main loop
 
         next_fire_time, firing_neuron = top_with_handle(fire_time_heap) # get absolute fire time of next spiking neuron
@@ -63,6 +71,7 @@ function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, targ
                 if abs(arrival_time - current_time) < 1e-12
                     pop!(arrival_heap)
                     ptc!(fire_time_heap, pending_targets[heap_handle], current_time, phase_speed, ptc_amplitude, phase_threshold)
+                    log_traces!(trace_log, trace_row, pending_targets[heap_handle], fire_time_heap, current_time, phase_threshold, phase_speed, drive)
                     delete!(pending_targets, heap_handle)
                 else
                     break
@@ -82,6 +91,7 @@ function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, targ
             firing_neuron_delay = neuron_delays[firing_neuron] # outgoing delay of spiking neuron
             if firing_neuron_delay == 0.0
                 ptc!(fire_time_heap, target_neurons, current_time, phase_speed, ptc_amplitude, phase_threshold) # immediate coupling
+                log_traces!(trace_log, trace_row, target_neurons, fire_time_heap, current_time, phase_threshold, phase_speed, drive)
             else
                 # schedule arrival in Heap 2
                 heap_handle = push!(arrival_heap, current_time + firing_neuron_delay)
@@ -89,12 +99,32 @@ function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, targ
             end
 
             update!(fire_time_heap, firing_neuron, current_time + phase_threshold) # reset: phase 0 fires again after phase_threshold
+            trace_row[firing_neuron] > 0 && push!(trace_log[trace_row[firing_neuron]], (current_time, 0.0)) # log reset
             push!(spike_times, current_time) # store spike times
             push!(spike_neuron_ids, firing_neuron) # store spiking neuron index
         end
     end
-    # output: rate, spike indices & times, sampled voltages (samples past the last event are dropped)
-    num_spikes / current_time / num_neurons / mem_time_const * phase_speed, spike_neuron_ids, spike_times * mem_time_const / phase_speed, voltages[:, 1:sample_idx-1]
+    # voltage traces in seconds: one (events × 2) matrix per traced neuron, columns = time, voltage after the event
+    traces = [[first.(log) .* (mem_time_const / phase_speed) last.(log)] for log in trace_log]
+    # output: rate, spike indices & times, sampled voltages (samples past the last event are dropped), voltage traces
+    num_spikes / current_time / num_neurons / mem_time_const * phase_speed, spike_neuron_ids, spike_times * mem_time_const / phase_speed, voltages[:, 1:sample_idx-1], traces
+end
+
+# Log the current voltage of every traced neuron in ids (state right after an event at current_time)
+function log_traces!(trace_log, trace_row, ids, fire_time_heap, current_time, phase_threshold, phase_speed, drive)
+    for i in ids
+        r = trace_row[i]
+        r == 0 && continue
+        phase = phase_threshold - (fire_time_heap[i] - current_time)
+        push!(trace_log[r], (current_time, drive * (1.0 - exp(-phase / phase_speed))))
+    end
+end
+
+# Exact voltage at time t (s) from a trace: free LIF relaxation toward the drive from the last logged event
+function trace_voltage(trace::Matrix{Float64}, t::Real, drive::Real, mem_time_const::Real)
+    k = searchsortedlast(view(trace, :, 1), t)
+    t0, v0 = trace[k, 1], trace[k, 2]
+    drive - (drive - v0) * exp(-(t - t0) / mem_time_const)
 end
 
 function export_connectivity_csv(
@@ -154,40 +184,33 @@ function ptc!(fire_time_heap, target_ids, current_time, phase_speed, ptc_amplitu
     end
 end
 
-# Reconstruct and plot voltage traces from spike times.
-# Physics: after each reset at t_reset, v(t) = I_eff * (1 - exp(-(t-t_reset)/τ))
-# Make sure to use I_eff = 1 + iext 
-# Claude comments: (Vreset=0, Vt=1 in normalized units).
-function plot_voltages(spike_times::Vector{Float64}, neuron_ids::Vector{Int64},
+# Plot exact voltage traces (traces output of lifnet_edited, for neurons trace_ids).
+# Between logged events: v(t) = I_eff - (I_eff - v0) * exp(-(t-t0)/τ), with I_eff = 1 + iext (Vreset=0, Vt=1);
+# each input or reset shows up as a vertical jump.
+function plot_voltages(traces::Vector{Matrix{Float64}}, trace_ids::AbstractVector{Int},
                        mem_time_const::Float64, in_degree::Int,
                        synaptic_weight::Real, target_rate::Float64;
-                       neurons_to_plot=1:5, t_window=0.5)
+                       t_window=0.5, points_per_segment=20)
     iext = mem_time_const * sqrt(in_degree) * synaptic_weight * target_rate
     I_eff = 1.0 + iext  # Vreset=0, Vt=1
 
-    t_max = min(maximum(spike_times), t_window)
-    nplot = length(neurons_to_plot)
+    nplot = length(trace_ids)
     figure(figsize=(10, 2 * nplot))
 
-    for (k, nid) in enumerate(neurons_to_plot)
-        t_spikes_n = sort(spike_times[neuron_ids .== nid])
-        t_spikes_n = t_spikes_n[t_spikes_n .<= t_max]
-
-        t_start = isempty(t_spikes_n) ? 0.0 : t_spikes_n[1]
-        reset_times = [t_start; t_spikes_n]
-
-        t_dense = LinRange(t_start, t_max, 5000)
-        v_trace = Vector{Float64}(undef, length(t_dense))
-        for (i, t) in enumerate(t_dense)
-            idx = searchsortedlast(reset_times, t - 1e-15)
-            t_last = idx >= 1 ? reset_times[idx] : t_start
-            v_trace[i] = min(I_eff * (1.0 - exp(-(t - t_last) / mem_time_const)), 1.0)
+    for (k, nid) in enumerate(trace_ids)
+        trace = traces[k]
+        event_times = [trace[trace[:, 1] .< t_window, 1]; t_window]
+        t_plot, v_plot = Float64[], Float64[]
+        for s in 1:length(event_times)-1 # free relaxation between consecutive events
+            ts = LinRange(event_times[s], event_times[s+1], points_per_segment)
+            append!(t_plot, ts)
+            append!(v_plot, I_eff .- (I_eff - trace[s, 2]) .* exp.(-(ts .- ts[1]) ./ mem_time_const))
         end
 
         subplot(nplot, 1, k)
-        plot(t_dense, v_trace, "b-", lw=0.8)
+        plot(t_plot, v_plot, "b-", lw=0.8)
+        axhline(1.0, color="gray", ls="--", lw=0.5) # threshold
         ylabel("v (neuron $nid)", fontsize=10)
-        ylim(-0.05, 1.1)
         k == nplot && xlabel("Time (s)", fontsize=12)
     end
     tight_layout()
@@ -216,8 +239,10 @@ if abspath(PROGRAM_FILE) == @__FILE__
     # sample voltages of neurons 1–1000 at 1000 evenly spaced times in the first 0.5 s
     record_ids = 1:1000
     sample_times_sec = LinRange(0.0, 0.5, 1000)
-    @time firing_rate, neuron_ids, spike_times, voltages = lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const, seed_init, seed_topo;
-                                                                         sample_times_sec, record_ids)
+    # and log exact voltage traces of neurons 1–5
+    trace_ids = 1:5
+    @time firing_rate, neuron_ids, spike_times, voltages, traces = lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const, seed_init, seed_topo;
+                                                                                 sample_times_sec, record_ids, trace_ids)
     println("  rate = $firing_rate Hz")
     println("  voltage range = $(extrema(voltages)) over $(size(voltages, 2)) samples")
     plot_voltage_histogram(voltages)
@@ -229,7 +254,6 @@ if abspath(PROGRAM_FILE) == @__FILE__
     println("Per-neuron delays (1–5 ms uniform):")
     @time firing_rate_d, neuron_ids_d, spike_times_d = lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const, seed_init, seed_topo, neuron_delays_sec)
     println("  rate = $firing_rate_d Hz")
-    #plot_voltages(spike_times, neuron_ids, mem_time_const, in_degree, synaptic_weight, target_rate; neurons_to_plot=1:200)
     #plot_voltage_histogram(spike_times, neuron_ids, mem_time_const, in_degree, synaptic_weight, target_rate)
 
 
@@ -263,7 +287,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
     # readline()  # keep window open until Enter is pressed
 
     # plot voltage traces for neurons 1–5 (no-delay run, first 0.5s)
-    plot_voltages(spike_times, neuron_ids, mem_time_const, in_degree, synaptic_weight, target_rate)
+    plot_voltages(traces, trace_ids, mem_time_const, in_degree, synaptic_weight, target_rate)
     show()
     readline()
 end

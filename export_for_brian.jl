@@ -5,7 +5,7 @@ include("LIF_ver.jl")
 function export_brian_comparison(outdir::String; num_neurons=200, in_degree=100, synaptic_weight=1, target_rate=1.0,
                                  mem_time_const=0.01, seed_init=1, seed_topo=1, seed_delay=1,
                                  with_delays=false, delay_range_sec=(0.001, 0.005),
-                                 dt=1e-5, duration=1.0, record_dt=1e-3)
+                                 dt=1e-5, duration=1.0, record_dt=1e-3, trace_ids=1:5)
     mkpath(outdir)
 
     # per-neuron delays as whole multiples of dt (Brian2 rounds delays to its time grid), seeded so reruns repeat
@@ -23,10 +23,10 @@ function export_brian_comparison(outdir::String; num_neurons=200, in_degree=100,
 
     # lifnet_edited stops after a spike count: rerun with more spikes until it passes `duration` (deterministic)
     num_spikes = ceil(Int, 10 * num_neurons * target_rate * duration)
-    local neuron_ids, spike_times, voltages
+    local neuron_ids, spike_times, voltages, traces
     while true
-        _, neuron_ids, spike_times, voltages = lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const,
-                                                             seed_init, seed_topo, delays_sec; sample_times_sec, record_ids=1:num_neurons)
+        _, neuron_ids, spike_times, voltages, traces = lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const,
+                                                                     seed_init, seed_topo, delays_sec; sample_times_sec, record_ids=1:num_neurons, trace_ids)
         maximum(spike_times) > duration && break
         num_spikes *= 2
     end
@@ -61,6 +61,14 @@ function export_brian_comparison(outdir::String; num_neurons=200, in_degree=100,
     open(joinpath(outdir, "voltages_julia.csv"), "w") do io
         println(io, "time_s,", join(string.(1:num_neurons), ","))
         writedlm(io, hcat(sample_times_sec, permutedims(voltages)), ',')
+    end
+
+    # exact voltage traces: voltage right after every input/reset of the traced neurons (brian2_compare.py records the same neurons)
+    open(joinpath(outdir, "traces_julia.csv"), "w") do io
+        println(io, "neuron_id,time_s,v")
+        for (nid, trace) in zip(trace_ids, traces), (t, v) in eachrow(trace)
+            t <= duration && println(io, nid, ",", t, ",", v)
+        end
     end
 
     println("$outdir: $(count(keep)) spikes in $(duration) s, $(length(sample_times_sec)) voltage samples, V range $(extrema(voltages))")
