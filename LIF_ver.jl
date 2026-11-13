@@ -1,6 +1,7 @@
 using DataStructures, RandomNumbers.Xorshifts, StatsBase, PyPlot, Random, DelimitedFiles
 
-function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const, seed_init, seed_topo, input_delays_sec::Vector{Float64}=Float64[])
+function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const, seed_init, seed_topo, input_delays_sec::Vector{Float64}=Float64[];
+                       sample_times_sec::AbstractVector{<:Real}=Float64[], record_ids::AbstractVector{Int}=Int[])
     ext_input = mem_time_const * sqrt(in_degree) * synaptic_weight * target_rate # ext_input given by balance equation
     phase_speed, ptc_amplitude = 1 / log(1.0 + 1 / ext_input), synaptic_weight / sqrt(in_degree) / (1.0 + ext_input) # phase velocity LIF
     phase_threshold, current_time = 1.0, 0.0 # threshold for LIF
@@ -24,6 +25,14 @@ function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, targ
         neuron_delays = input_delays_sec .* phase_speed / mem_time_const
     end
 
+    # voltage sampling: sample times converted from seconds to internal phase units
+    @assert all(1 .<= record_ids .<= num_neurons) "record_ids must be in 1:num_neurons"
+    sample_times = sort(collect(Float64, sample_times_sec)) .* phase_speed / mem_time_const
+    num_samples = length(sample_times)
+    voltages = fill(NaN, length(record_ids), num_samples) # row = recorded neuron, col = sample
+    sample_idx = 1
+    drive = 1.0 + ext_input # I_eff (Vreset=0, Vt=1)
+
     while length(spike_neuron_ids) < num_spikes # main loop
 
         next_fire_time, firing_neuron = top_with_handle(fire_time_heap) # get absolute fire time of next spiking neuron
@@ -33,6 +42,16 @@ function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, targ
             next_arrival_time = Inf
         else
             next_arrival_time, _ = top_with_handle(arrival_heap)
+        end
+
+        # record voltages at sample times that fall before the next event (state is exact between events)
+        next_event_time = min(next_fire_time, next_arrival_time)
+        while sample_idx <= num_samples && sample_times[sample_idx] < next_event_time
+            for (r, i) in enumerate(record_ids)
+                phase = phase_threshold - (fire_time_heap[i] - sample_times[sample_idx]) # current phase of neuron i
+                voltages[r, sample_idx] = drive * (1.0 - exp(-phase / phase_speed)) # phase → voltage
+            end
+            sample_idx += 1
         end
 
         if next_arrival_time <= next_fire_time
@@ -74,7 +93,8 @@ function lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, targ
             push!(spike_neuron_ids, firing_neuron) # store spiking neuron index
         end
     end
-    num_spikes / current_time / num_neurons / mem_time_const * phase_speed, spike_neuron_ids, spike_times * mem_time_const / phase_speed # output: rate, spike times & indices
+    # output: rate, spike indices & times, sampled voltages (samples past the last event are dropped)
+    num_spikes / current_time / num_neurons / mem_time_const * phase_speed, spike_neuron_ids, spike_times * mem_time_const / phase_speed, voltages[:, 1:sample_idx-1]
 end
 
 function export_connectivity_csv(
@@ -173,38 +193,13 @@ function plot_voltages(spike_times::Vector{Float64}, neuron_ids::Vector{Int64},
     tight_layout()
 end
 
-# Reconstruct voltages for all neurons at uniformly sampled time points and plot histogram.
-function plot_voltage_histogram(spike_times::Vector{Float64}, neuron_ids::Vector{Int64},
-                                mem_time_const::Float64, in_degree::Int,
-                                synaptic_weight::Real, target_rate::Float64;
-                                n_time_samples=1000, t_window=0.5, bins=1000)
-    iext = mem_time_const * sqrt(in_degree) * synaptic_weight * target_rate
-    I_eff = 1.0 + iext
-
-    t_max = min(maximum(spike_times), t_window)
-    t_samples = collect(LinRange(0.0, t_max, n_time_samples))
-    neurons = unique(neuron_ids)
-    all_voltages = Vector{Float64}(undef, length(neurons) * n_time_samples)
-
-    idx_out = 1
-    for nid in neurons
-        t_spikes_n = sort(spike_times[neuron_ids .== nid])
-        t_spikes_n = t_spikes_n[t_spikes_n .<= t_max]
-        reset_times = isempty(t_spikes_n) ? [0.0] : [0.0; t_spikes_n]
-
-        for t in t_samples
-            idx = searchsortedlast(reset_times, t - 1e-15)
-            t_last = idx >= 1 ? reset_times[idx] : 0.0
-            all_voltages[idx_out] = I_eff * (1.0 - exp(-(t - t_last) / mem_time_const))
-            idx_out += 1
-        end
-    end
-
+# Plot histogram of voltages sampled during the simulation (voltages output of lifnet_edited).
+function plot_voltage_histogram(voltages::Matrix{Float64}; bins=1000)
     figure()
-    plt.hist(all_voltages, bins=bins, density=true, edgecolor="none")
+    plt.hist(vec(voltages), bins=bins, density=true, edgecolor="none")
     xlabel("Voltage (Vt=1, Vreset=0)", fontsize=12)
     ylabel("Density", fontsize=12)
-    title("Voltage distribution ($(length(neurons)) neurons)", fontsize=12)
+    title("Voltage distribution ($(size(voltages, 1)) neurons, $(size(voltages, 2)) samples)", fontsize=12)
     tight_layout()
 end
 
@@ -218,9 +213,14 @@ if abspath(PROGRAM_FILE) == @__FILE__
     # run & benchmark: no delay (baseline)
     GC.gc()
     println("No delay:")
-    @time firing_rate, neuron_ids, spike_times = lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const, seed_init, seed_topo)
+    # sample voltages of neurons 1–1000 at 1000 evenly spaced times in the first 0.5 s
+    record_ids = 1:1000
+    sample_times_sec = LinRange(0.0, 0.5, 1000)
+    @time firing_rate, neuron_ids, spike_times, voltages = lifnet_edited(num_neurons, num_spikes, in_degree, synaptic_weight, target_rate, mem_time_const, seed_init, seed_topo;
+                                                                         sample_times_sec, record_ids)
     println("  rate = $firing_rate Hz")
-    plot_voltage_histogram(spike_times, neuron_ids, mem_time_const, in_degree, synaptic_weight, target_rate)
+    println("  voltage range = $(extrema(voltages)) over $(size(voltages, 2)) samples")
+    plot_voltage_histogram(voltages)
 
 
     # run & benchmark: heterogeneous per-neuron delays (uniform in [1ms, 5ms])
